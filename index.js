@@ -1,38 +1,64 @@
 const express = require('express');
+const { OpenAI } = require('openai');
+
 const app = express();
 
-// Tell our server to understand data sent by WhatsApp/Twilio
+// Initialize the OpenAI tool, but point it directly to NVIDIA's server endpoints
+const nvidiaAI = new OpenAI({
+    apiKey: process.env.NVIDIA_API_KEY,
+    baseURL: 'https://integrate.api.nvidia.com/v1', 
+});
+
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// This is our main WhatsApp pathway (Webhook)
-app.post('/whatsapp', (req, res) => {
-    // 1. Grab the message the user sent
+app.post('/whatsapp', async (req, res) => {
     const userMessage = req.body.Body || '';
-    
-    console.log(`Received message: ${userMessage}`);
+    console.log(`Received WhatsApp message: ${userMessage}`);
 
-    // 2. Draft a simple reply
-    const replyMessage = `Stuck AI received your message: "${userMessage}". We are building the engine right now!`;
+    try {
+        // Send the user's message to Meta's powerful open-source Llama model via NVIDIA
+        const response = await nvidiaAI.chat.completions.create({
+            model: "meta/llama-3.3-70b-instruct", 
+            messages: [
+                { 
+                    role: "system", 
+                    content: "You are Stuck AI, an intelligent traffic assistant for commuters in Africa. Keep your answers brief, warm, helpful, and conversational. You don't have access to live maps yet, so if asked about specific current traffic, politely explain that you are currently learning the roads." 
+                },
+                { role: "user", content: userMessage }
+            ],
+        });
 
-    // 3. Format the reply so Twilio understands it (using XML)
-    const twimlResponse = `
-        <Response>
-            <Message>${replyMessage}</Message>
-        </Response>
-    `;
+        // Extract the open-source AI's reply
+        const aiReply = response.choices[0].message.content;
 
-    // 4. Send the reply back to Twilio
-    res.header('Content-Type', 'text/xml');
-    res.status(200).send(twimlResponse);
+        // Format for Twilio WhatsApp
+        const twimlResponse = `
+            <Response>
+                <Message>${aiReply}</Message>
+            </Response>
+        `;
+
+        res.header('Content-Type', 'text/xml');
+        res.status(200).send(twimlResponse);
+
+    } catch (error) {
+        console.error("NVIDIA API Error:", error);
+        
+        const errorResponse = `
+            <Response>
+                <Message>Oops! My brain hit a temporary traffic jam. Try texting me again in a moment.</Message>
+            </Response>
+        `;
+        res.header('Content-Type', 'text/xml');
+        res.status(200).send(errorResponse);
+    }
 });
 
-// A basic homepage check to ensure our server is alive
 app.get('/', (req, res) => {
-    res.send('Stuck AI Server is active and running!');
+    res.send('Stuck AI Server is active and running for free with NVIDIA NIM!');
 });
 
-// Start the server on the port Render assigns us
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
