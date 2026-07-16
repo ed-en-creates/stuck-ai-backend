@@ -1,88 +1,107 @@
 const express = require('express');
 const { OpenAI } = require('openai');
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 
-// 1. Initialize Groq using the official OpenAI SDK
+// Initialize Groq AI
 const groqAI = new OpenAI({
     apiKey: process.env.GROQ_API_KEY,
     baseURL: 'https://api.groq.com/openai/v1', 
 });
 
-// Parse incoming URL-encoded and JSON payloads
+// Initialize Supabase Database
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// 2. The main WhatsApp Webhook endpoint
 app.post('/whatsapp', async (req, res) => {
-    // Safely grab the incoming message and trim extra spaces
+    const fromNumber = req.body.From || ''; // User's WhatsApp number
     const rawMessage = req.body.Body || '';
     const userMessage = rawMessage.trim();
-    
-    console.log(`📩 Incoming message from ${req.body.From || 'Unknown'}: "${userMessage}"`);
 
-    // Guard: If the message is empty (e.g., user sent an image, document, or sticker)
+    // Catch WhatsApp Location Pin coordinates if provided
+    const incomingLatitude = req.body.Latitude || null;
+    const incomingLongitude = req.body.Longitude || null;
+
+    console.log(`📩 Incoming message from ${fromNumber}`);
+
+    // FLOW A: User drops an actual location pin
+    if (incomingLatitude && incomingLongitude) {
+        console.log(`📍 User shared a GPS location pin: ${incomingLatitude}, ${incomingLongitude}`);
+        
+        // Save it to Supabase as their current home base for simplicity
+        const { error } = await supabase.from('user_routes').insert([{
+            phone_number: fromNumber,
+            location_type: 'home',
+            latitude: incomingLatitude,
+            longitude: incomingLongitude,
+            address: 'Shared WhatsApp Pin'
+        }]);
+
+        let confirmationText = "Awesome! I've pinned this location as your Home address. Next time you ask for traffic, I will use this spot!";
+        if (error) {
+            console.error("Supabase Save Error:", error);
+            confirmationText = "I received your location pin, but had trouble saving it to my memory map. Try again!";
+        }
+
+        const twiml = `<Response><Message>${confirmationText}</Message></Response>`;
+        res.header('Content-Type', 'text/xml');
+        return res.status(200).send(twiml);
+    }
+
+    // Guard: If message is empty and no location pin was dropped
     if (!userMessage) {
-        console.log(`⚠️ Received empty text body. Skipping API call.`);
-        const emptyResponse = `
-            <Response>
-                <Message>I received your message, but I can only read text right now! Ask me a traffic question.</Message>
-            </Response>
-        `;
+        const emptyResponse = `<Response><Message>Send me a text or drop a location pin to get started!</Message></Response>`;
         res.header('Content-Type', 'text/xml');
         return res.status(200).send(emptyResponse);
     }
 
     try {
-        console.log(`🚀 Forwarding message to Groq (llama-3.1-8b-instant)...`);
-        
-        // 3. Make the API call to Groq
+        // Fetch saved user context to help the AI remember them
+        const { data: savedRoutes } = await supabase
+            .from('user_routes')
+            .select('location_type, address')
+            .eq('phone_number', fromNumber);
+
+        let memoryPrompt = "You don't know their saved routes yet.";
+        if (savedRoutes && savedRoutes.length > 0) {
+            memoryPrompt = "You know the following about them: " + savedRoutes.map(r => `${r.location_type}: ${r.address}`).join(', ');
+        }
+
+        // Make the call to Groq
         const response = await groqAI.chat.completions.create({
-            model: "llama-3.1-8b-instant", // High-speed, ultra-stable production model ID on Groq
+            model: "llama-3.1-8b-instant",
             messages: [
                 { 
                     role: "system", 
-                    content: "You are Stuck AI, a warm, helpful mobility assistant for commuters in Africa. Keep your responses engaging, conversational, and under two short sentences. You do not have access to real-time maps yet, so if asked about specific routes, politely mention you are preparing for launch." 
+                    content: `You are Stuck AI, a warm, helpful mobility assistant for commuters in Africa. Keep responses under two sentences. ${memoryPrompt}. If they ask you to save a location like 'Save my office as Lekki', instruct them to drop a location pin or tell you clearly.` 
                 },
                 { role: "user", content: userMessage }
             ],
-            max_tokens: 120, // Enough headroom for a friendly 2-sentence response
-            temperature: 0.7 // Balanced between creative/conversational and structured
+            max_tokens: 120,
+            temperature: 0.7
         });
 
         const aiReply = response.choices[0].message.content.trim();
-        console.log(`✅ Groq AI successfully generated response: "${aiReply}"`);
-
-        // 4. Send the TwiML XML response back to Twilio
-        const twimlResponse = `
-            <Response>
-                <Message>${aiReply}</Message>
-            </Response>
-        `;
+        const twimlResponse = `<Response><Message>${aiReply}</Message></Response>`;
 
         res.header('Content-Type', 'text/xml');
         return res.status(200).send(twimlResponse);
 
     } catch (error) {
-        // Log the exact details of the error to your Render dashboard
-        console.error("❌ Groq API Error:", error.message || error);
-        
-        const errorResponse = `
-            <Response>
-                <Message>Oops! My brain hit a temporary bottleneck. Try sending your text again in a few seconds!</Message>
-            </Response>
-        `;
+        console.error("❌ Process Error:", error);
+        const errorResponse = `<Response><Message>Oops! Brain traffic jam. Send your text again!</Message></Response>`;
         res.header('Content-Type', 'text/xml');
         return res.status(200).send(errorResponse);
     }
 });
 
-// 5. Basic server home route for health monitoring
 app.get('/', (req, res) => {
-    res.send('🚀 Stuck AI MVP is active and listening to Groq!');
+    res.send('🚀 Stuck AI MVP with Memory Engine is live!');
 });
 
-// 6. Start the server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`🟢 Stuck AI server is up and running on port ${PORT}`);
