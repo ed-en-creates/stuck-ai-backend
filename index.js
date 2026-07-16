@@ -3,7 +3,6 @@ const { OpenAI } = require('openai');
 
 const app = express();
 
-// Initialize the OpenAI tool, but point it directly to NVIDIA's server endpoints
 const nvidiaAI = new OpenAI({
     apiKey: process.env.NVIDIA_API_KEY,
     baseURL: 'https://integrate.api.nvidia.com/v1', 
@@ -14,10 +13,9 @@ app.use(express.json());
 
 app.post('/whatsapp', async (req, res) => {
     const userMessage = req.body.Body || '';
-    console.log(`Received WhatsApp message: ${userMessage}`);
+    console.log(`Processing with Llama: ${userMessage}`);
 
     try {
-        // Send the user's message to Meta's powerful open-source Llama model via NVIDIA
         const response = await nvidiaAI.chat.completions.create({
             model: "meta/llama-3.3-70b-instruct", 
             messages: [
@@ -29,10 +27,8 @@ app.post('/whatsapp', async (req, res) => {
             ],
         });
 
-        // Extract the open-source AI's reply
         const aiReply = response.choices[0].message.content;
 
-        // Format for Twilio WhatsApp
         const twimlResponse = `
             <Response>
                 <Message>${aiReply}</Message>
@@ -44,7 +40,6 @@ app.post('/whatsapp', async (req, res) => {
 
     } catch (error) {
         console.error("NVIDIA API Error:", error);
-        
         const errorResponse = `
             <Response>
                 <Message>Oops! My brain hit a temporary traffic jam. Try texting me again in a moment.</Message>
