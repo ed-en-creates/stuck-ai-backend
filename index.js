@@ -1,114 +1,137 @@
+require('dotenv').config();
 const express = require('express');
-const { OpenAI } = require('openai');
+const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
-
-// 1. Initialize Groq AI pointing to their fast API endpoint
-const groqAI = new OpenAI({
-    apiKey: process.env.GROQ_API_KEY,
-    baseURL: 'https://api.groq.com/openai/v1', 
-});
-
-// 2. Initialize Supabase Database
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-
-// Parse incoming URL-encoded and JSON payloads
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// 3. The main WhatsApp Webhook endpoint
-app.post('/whatsapp', async (req, res) => {
-    const fromNumber = req.body.From || ''; 
-    const rawMessage = req.body.Body || '';
-    const userMessage = rawMessage.trim();
+// Initialize Supabase Client
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_KEY
+);
 
-    // Support BOTH lowercase and uppercase coordinate parameters sent by Twilio
-    const incomingLatitude = req.body.Latitude || req.body.latitude || null;
-    const incomingLongitude = req.body.Longitude || req.body.longitude || null;
+// Helper function to get travel time from Geoapify
+async function getRouteDetails(startLat, startLon, endLat, endLon) {
+  const apiKey = process.env.GEOAPIFY_API_KEY;
+  const url = `https://api.geoapify.com/v1/routing?waypoints=${startLat},${startLon}|${endLat},${endLon}&mode=drive&apiKey=${apiKey}`;
 
-    console.log(`📩 Incoming payload from ${fromNumber}. Text: "${userMessage}"`);
-    console.log(`📍 Received Coordinates: Lat: ${incomingLatitude}, Lng: ${incomingLongitude}`);
+  try {
+    const response = await axios.get(url);
+    if (response.data && response.data.features && response.data.features.length > 0) {
+      const properties = response.data.features[0].properties;
+      
+      // Geoapify returns distance in meters and time in seconds
+      const distanceKm = (properties.distance / 1000).toFixed(1);
+      const timeMinutes = Math.round(properties.time / 60);
 
-    // FLOW A: User drops an actual location pin
-    if (incomingLatitude && incomingLongitude) {
-        console.log(`💾 Attempting to save GPS location pin to Supabase: ${incomingLatitude}, ${incomingLongitude}`);
-        
-        const { error } = await supabase.from('user_routes').insert([{
-            phone_number: fromNumber,
-            location_type: 'home', // Saves as home by default for now
-            latitude: String(incomingLatitude),
-            longitude: String(incomingLongitude),
-            address: 'Shared WhatsApp Pin'
-        }]);
-
-        let confirmationText = "Awesome! I've pinned this location as your Home address. Next time you ask for traffic, I'll use this spot!";
-        if (error) {
-            console.error("❌ Supabase Save Error:", error);
-            confirmationText = "I received your location pin, but had trouble saving it to my memory map. Try again!";
-        }
-
-        const twiml = `<Response><Message>${confirmationText}</Message></Response>`;
-        res.header('Content-Type', 'text/xml');
-        return res.status(200).send(twiml);
+      return { distanceKm, timeMinutes };
     }
+    return null;
+  } catch (error) {
+    console.error('❌ Geoapify Routing Error:', error.response?.data || error.message);
+    return null;
+  }
+}
 
-    // FLOW B: Guard against empty messages (Only triggers if they sent NO text AND NO coordinates)
-    if (!userMessage && !incomingLatitude) {
-        console.log(`⚠️ Empty text and no coordinates detected.`);
-        const emptyResponse = `<Response><Message>Send me a text or drop a location pin to get started!</Message></Response>`;
-        res.header('Content-Type', 'text/xml');
-        return res.status(200).send(emptyResponse);
-    }
+// WhatsApp Webhook Endpoint
+app.post('/webhook', async (req, res) => {
+  const incomingMsg = req.body.Body || '';
+  const fromNumber = req.body.From; // User's WhatsApp phone number
+  
+  // Extract Coordinates from Twilio WhatsApp Location payload
+  const latitude = req.body.Latitude;
+  const longitude = req.body.Longitude;
 
-    // FLOW C: Standard conversational traffic message
+  console.log(`✉️ Received message from ${fromNumber}: "${incomingMsg}"`);
+
+  // Create empty Twilio TwiML response
+  let twimlResponse = '<?xml version="1.0" encoding="UTF-8"?><Response>';
+
+  if (latitude && longitude) {
+    console.log(`📍 Received location pin: Lat ${latitude}, Lon ${longitude}`);
+
     try {
-        // Fetch saved user context to help Groq remember their pinned locations
-        const { data: savedRoutes } = await supabase
-            .from('user_routes')
-            .select('location_type, address, latitude, longitude')
-            .eq('phone_number', fromNumber);
+      // 1. Save to Supabase
+      const { data, error } = await supabase
+        .from('user_routes')
+        .upsert(
+          { 
+            phone_number: fromNumber, 
+            latitude: parseFloat(latitude), 
+            longitude: parseFloat(longitude),
+            updated_at: new Date()
+          }, 
+          { onConflict: 'phone_number' }
+        );
 
-        let memoryPrompt = "You don't know their saved routes yet.";
-        if (savedRoutes && savedRoutes.length > 0) {
-            memoryPrompt = "You know the following about them: " + savedRoutes.map(r => `${r.location_type}: ${r.address || (r.latitude + ',' + r.longitude)}`).join(', ');
-        }
+      if (error) {
+        throw error;
+      }
 
-        // Send contextual prompt to Groq
-        const response = await groqAI.chat.completions.create({
-            model: "llama-3.1-8b-instant",
-            messages: [
-                { 
-                    role: "system", 
-                    content: `You are Stuck AI, a warm, helpful mobility assistant for commuters in Africa. Keep responses under two sentences. ${memoryPrompt}. If they ask you to save a location like 'Save my office as Lekki', instruct them to drop a location pin or tell you clearly.` 
-                },
-                { role: "user", content: userMessage }
-            ],
-            max_tokens: 120,
-            temperature: 0.7
-        });
+      console.log('✅ Coordinates successfully saved/updated in Supabase!');
 
-        const aiReply = response.choices[0].message.content.trim();
-        const twimlResponse = `<Response><Message>${aiReply}</Message></Response>`;
+      // 2. Demo Route Calculation (e.g., routing to a dummy Office coordinate for testing)
+      // Let's set a demo target location in Benin City (e.g., King's Square / Ring Road: 6.3350, 5.6222)
+      const officeLat = 6.3350;
+      const officeLon = 5.6222;
 
-        res.header('Content-Type', 'text/xml');
-        return res.status(200).send(twimlResponse);
+      const route = await getRouteDetails(latitude, longitude, officeLat, officeLon);
 
-    } catch (error) {
-        console.error("❌ Process Error:", error);
-        const errorResponse = `<Response><Message>Oops! Brain traffic jam. Send your text again!</Message></Response>`;
-        res.header('Content-Type', 'text/xml');
-        return res.status(200).send(errorResponse);
+      let replyMessage = '';
+      if (route) {
+        replyMessage = `Awesome! I've pinned this location as your Home address 🏠.\n\n🚗 *Commute Check:*\nTo get to Ring Road from here is about *${route.distanceKm} km* and will take you *${route.timeMinutes} mins* in current traffic.`;
+      } else {
+        replyMessage = `Awesome! I've pinned this location as your Home address 🏠. (However, I couldn't calculate the live route times right now. I'll monitor it!)`;
+      }
+
+      twimlResponse += `<Message>${replyMessage}</Message>`;
+
+    } catch (dbError) {
+      console.error('❌ Supabase Save Error:', dbError);
+      twimlResponse += `<Message>Received your location pin, but had trouble saving it to my memory map. Try again!</Message>`;
     }
+
+  } else {
+    // Standard AI Brain Conversation (Groq)
+    try {
+      const groqResponse = await axios.post(
+        'https://api.groq.com/openapi/v1/chat/completions',
+        {
+          model: 'llama3-8b-8192',
+          messages: [
+            { 
+              role: 'system', 
+              content: 'You are Stuck AI, a friendly local traffic assistant. Keep answers brief, under 2 sentences.' 
+            },
+            { role: 'user', content: incomingMsg }
+          ]
+        },
+        {
+          headers: {
+            'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+
+      const aiReply = groqResponse.data.choices[0].message.content;
+      twimlResponse += `<Message>${aiReply}</Message>`;
+
+    } catch (aiError) {
+      console.error('❌ Groq AI Error:', aiError.message);
+      twimlResponse += `<Message>Oops, my brain stalled for a second. Try saying that again!</Message>`;
+    }
+  }
+
+  twimlResponse += '</Response>';
+  res.set('Content-Type', 'text/xml');
+  res.send(twimlResponse);
 });
 
-// Basic server home route for health monitoring
-app.get('/', (req, res) => {
-    res.send('🚀 Stuck AI MVP with Memory Engine is live!');
-});
-
-// Start the server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`🟢 Stuck AI server is up and running on port ${PORT}`);
+  console.log(`🚀 Stuck AI server is running on port ${PORT}`);
 });
