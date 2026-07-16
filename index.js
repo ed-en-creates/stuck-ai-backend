@@ -13,21 +13,23 @@ app.use(express.json());
 
 app.post('/whatsapp', async (req, res) => {
     const userMessage = req.body.Body || '';
-    console.log(`Processing with Llama: ${userMessage}`);
+    console.log(`🚀 Sending to Ultra-Fast Llama: ${userMessage}`);
 
     try {
         const response = await nvidiaAI.chat.completions.create({
-            model: "meta/llama-3.3-70b-instruct", 
+            model: "meta/llama-3-8b-instruct", // Lightweight, lightning-fast model
             messages: [
                 { 
                     role: "system", 
-                    content: "You are Stuck AI, an intelligent traffic assistant for commuters in Africa. Keep your answers brief, warm, helpful, and conversational. You don't have access to live maps yet, so if asked about specific current traffic, politely explain that you are currently learning the roads." 
+                    content: "You are Stuck AI, an assistant for African commuters. Keep your response under two short sentences. Be incredibly brief and warm." 
                 },
                 { role: "user", content: userMessage }
             ],
+            max_tokens: 80 // Hard limit on response length to ensure it returns in under 2 seconds
         });
 
         const aiReply = response.choices[0].message.content;
+        console.log(`✅ AI Response Generated: ${aiReply}`);
 
         const twimlResponse = `
             <Response>
@@ -39,10 +41,10 @@ app.post('/whatsapp', async (req, res) => {
         res.status(200).send(twimlResponse);
 
     } catch (error) {
-        console.error("NVIDIA API Error:", error);
+        console.error("❌ NVIDIA API Error:", error);
         const errorResponse = `
             <Response>
-                <Message>Oops! My brain hit a temporary traffic jam. Try texting me again in a moment.</Message>
+                <Message>Oops! Brain traffic jam. Send your text again!</Message>
             </Response>
         `;
         res.header('Content-Type', 'text/xml');
@@ -51,7 +53,7 @@ app.post('/whatsapp', async (req, res) => {
 });
 
 app.get('/', (req, res) => {
-    res.send('Stuck AI Server is active and running for free with NVIDIA NIM!');
+    res.send('Stuck AI Server is optimized and flying with fast Llama!');
 });
 
 const PORT = process.env.PORT || 3000;
