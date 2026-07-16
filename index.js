@@ -17,7 +17,7 @@ app.post('/whatsapp', async (req, res) => {
 
     try {
         const response = await nvidiaAI.chat.completions.create({
-            model: "meta/llama-3-8b-instruct", // Lightweight, lightning-fast model
+            model: "meta/llama-3.1-8b-instruct", // Added the .1 here!
             messages: [
                 { 
                     role: "system", 
@@ -25,7 +25,7 @@ app.post('/whatsapp', async (req, res) => {
                 },
                 { role: "user", content: userMessage }
             ],
-            max_tokens: 80 // Hard limit on response length to ensure it returns in under 2 seconds
+            max_tokens: 80 
         });
 
         const aiReply = response.choices[0].message.content;
