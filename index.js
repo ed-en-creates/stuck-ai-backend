@@ -1,125 +1,180 @@
+require('dotenv').config();
 const express = require('express');
 const { OpenAI } = require('openai');
-const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// 1. Initialize Groq AI 
+// 🧠 1. Initialize Groq AI (The Brain)
 const groqAI = new OpenAI({
     apiKey: process.env.GROQ_API_KEY,
     baseURL: 'https://api.groq.com/openai/v1', 
 });
 
-// 2. Initialize Supabase Database
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+// 👻 2. Initialize Ghost Memory (RAM Storage)
+// This stores locations only while the server is running. No databases, zero privacy risk.
+const activeSessions = new Map();
 
-// 3. Helper function to get travel time from Geoapify using native fetch
-async function getRouteDetails(startLat, startLon, endLat, endLon) {
-  const apiKey = process.env.GEOAPIFY_API_KEY;
-  const url = `https://api.geoapify.com/v1/routing?waypoints=${startLat},${startLon}|${endLat},${endLon}&mode=drive&apiKey=${apiKey}`;
-
-  try {
-    const response = await fetch(url);
-    const data = await response.json();
-    if (data && data.features && data.features.length > 0) {
-      const properties = data.features[0].properties;
-      const distanceKm = (properties.distance / 1000).toFixed(1);
-      const timeMinutes = Math.round(properties.time / 60);
-      return { distanceKm, timeMinutes };
+// 🗺️ 3. Helper: Geocoding (Converts text like "Jabi Lake Mall" to Coordinates)
+async function geocodeAddress(address) {
+    const url = `https://api.geoapify.com/v1/geocode/search?text=${encodeURIComponent(address)}&limit=1&apiKey=${process.env.GEOAPIFY_API_KEY}`;
+    try {
+        const response = await fetch(url);
+        const data = await response.json();
+        if (data.features && data.features.length > 0) {
+            return {
+                lat: data.features[0].properties.lat,
+                lng: data.features[0].properties.lon
+            };
+        }
+        return null;
+    } catch (error) {
+        console.error('Geocoding Error:', error);
+        return null;
     }
-    return null;
-  } catch (error) {
-    console.error('❌ Geoapify Routing Error:', error.message);
-    return null;
-  }
 }
 
-// 4. Main WhatsApp Endpoint
-app.post('/whatsapp', async (req, res) => {
-    const fromNumber = req.body.From || ''; 
-    const rawMessage = req.body.Body || '';
-    const userMessage = rawMessage.trim();
-
-    // Support BOTH lowercase and uppercase coordinate parameters sent by Twilio
-    const latitude = req.body.Latitude || req.body.latitude || null;
-    const longitude = req.body.Longitude || req.body.longitude || null;
-
-    console.log(`📩 Incoming payload from ${fromNumber}. Text: "${userMessage}"`);
-
-    // FLOW A: User drops an actual location pin
-    if (latitude && longitude) {
-        console.log(`📍 Received Coordinates: Lat: ${latitude}, Lng: ${longitude}`);
-        
-        try {
-            // Save to Supabase
-            await supabase.from('user_routes').insert([{
-                phone_number: fromNumber,
-                location_type: 'home',
-                latitude: String(latitude),
-                longitude: String(longitude),
-                address: 'Shared WhatsApp Pin'
-            }]);
-
-            // Demo Route Calculation (Target: Ring Road, Benin City: 6.3350, 5.6222)
-            const targetLat = 6.3350;
-            const targetLon = 5.6222;
-
-            const route = await getRouteDetails(latitude, longitude, targetLat, targetLon);
-
-            let replyMessage = '';
-            if (route) {
-                replyMessage = `Awesome! I've pinned this location as your Home address 🏠.\n\n🚗 *Commute Check:*\nTo get to Ring Road from here is about *${route.distanceKm} km* and will take you *${route.timeMinutes} mins* in current traffic.`;
-            } else {
-                replyMessage = `Awesome! I've pinned this location as your Home address 🏠. (However, I couldn't calculate the live route times right now. I'll monitor it!)`;
-            }
-
-            const twiml = `<Response><Message>${replyMessage}</Message></Response>`;
-            res.header('Content-Type', 'text/xml');
-            return res.status(200).send(twiml);
-
-        } catch (error) {
-            console.error("❌ Process Error:", error);
-            const twiml = `<Response><Message>Received your location pin, but had trouble saving it to my memory map. Try again!</Message></Response>`;
-            res.header('Content-Type', 'text/xml');
-            return res.status(200).send(twiml);
-        }
-    }
-
-    // FLOW B: Standard conversational traffic message
+// 🚗 4. Helper: Routing (Calculates distance and time)
+async function getRouteDetails(startLat, startLon, endLat, endLon) {
+    const url = `https://api.geoapify.com/v1/routing?waypoints=${startLat},${startLon}|${endLat},${endLon}&mode=drive&apiKey=${process.env.GEOAPIFY_API_KEY}`;
     try {
-        // Send contextual prompt to Groq
+        const response = await fetch(url);
+        const data = await response.json();
+        if (data.features && data.features.length > 0) {
+            const props = data.features[0].properties;
+            return {
+                distanceKm: (props.distance / 1000).toFixed(1),
+                timeMinutes: Math.round(props.time / 60)
+            };
+        }
+        return null;
+    } catch (error) {
+        console.error('Routing Error:', error);
+        return null;
+    }
+}
+
+// 💬 5. Helper: Groq Humanizer (Makes the output sound natural)
+async function generateHumanReply(prompt) {
+    try {
         const response = await groqAI.chat.completions.create({
             model: "llama-3.1-8b-instant",
-            messages: [
-                { 
-                    role: "system", 
-                    content: `You are Stuck AI, a warm, helpful mobility assistant for commuters exclusively in Benin City, Edo State, Nigeria. Do not suggest routes in Lagos. Keep responses under two sentences. If they ask about routing times, instruct them to send a WhatsApp Location Pin.` 
-                },
-                { role: "user", content: userMessage }
-            ],
-            max_tokens: 120,
+            messages: [{ role: "system", content: prompt }],
+            max_tokens: 150,
             temperature: 0.7
         });
-
-        const aiReply = response.choices[0].message.content.trim();
-        const twimlResponse = `<Response><Message>${aiReply}</Message></Response>`;
-
-        res.header('Content-Type', 'text/xml');
-        return res.status(200).send(twimlResponse);
-
+        return response.choices[0].message.content.trim();
     } catch (error) {
-        console.error("❌ AI Error:", error);
-        const errorResponse = `<Response><Message>Oops! Brain traffic jam. Send your text again!</Message></Response>`;
-        res.header('Content-Type', 'text/xml');
-        return res.status(200).send(errorResponse);
+        return "Got it! Traffic looks clear, you're good to go.";
     }
+}
+
+// 🚦 6. Main WhatsApp Webhook (The Conversation State Machine)
+app.post('/whatsapp', async (req, res) => {
+    const fromNumber = req.body.From;
+    const rawMessage = req.body.Body || '';
+    const userMessage = rawMessage.trim().toLowerCase();
+    
+    // Extract GPS coordinates if user sent a Live Location pin
+    const lat = req.body.Latitude || req.body.latitude;
+    const lng = req.body.Longitude || req.body.longitude;
+
+    // Create a Ghost Memory session for new users
+    if (!activeSessions.has(fromNumber)) {
+        activeSessions.set(fromNumber, { 
+            state: 'START', 
+            home: null, 
+            work: null, 
+            currentLocation: null 
+        });
+    }
+    const session = activeSessions.get(fromNumber);
+    let replyMessage = '';
+
+    // --- CONVERSATION LOGIC ---
+
+    // EVENT A: User sends a Location Pin
+    if (lat && lng) {
+        session.currentLocation = { lat, lng };
+        session.state = 'AWAITING_LABEL';
+        replyMessage = "Got it! 📍 Do you want me to pin this as your Home, Work, or just a temporary starting point?";
+    } 
+    
+    // EVENT B: New User says Hello/Start
+    else if (session.state === 'START' || userMessage.includes('hello') || userMessage.includes('hi')) {
+        replyMessage = "Hey there! 👋 Welcome to Stuck AI. Where are you currently, and where are you headed to? If you don't mind, drop your live location pin so I can see exactly where we're starting from!";
+        session.state = 'AWAITING_LOCATION';
+    } 
+    
+    // EVENT C: User labels their location (Work/Home)
+    else if (session.state === 'AWAITING_LABEL') {
+        if (userMessage.includes('work')) {
+            session.work = session.currentLocation;
+            replyMessage = "Alright, your Work address is now pinned! 🏢 I'll remember this. So, where are you headed to right now?";
+            session.state = 'READY_TO_ROUTE';
+        } else if (userMessage.includes('home')) {
+            session.home = session.currentLocation;
+            replyMessage = "Alright, your Home address is now pinned! 🏠 I've got it locked in. Where are you headed to right now?";
+            session.state = 'READY_TO_ROUTE';
+        } else {
+            replyMessage = "Perfect, I'll just use this as a temporary starting point! 📍 Where are you headed to?";
+            session.state = 'READY_TO_ROUTE';
+        }
+    } 
+    
+    // EVENT D: User gives a destination (The Routing Engine)
+    else if (session.state === 'READY_TO_ROUTE') {
+        let targetCoords = null;
+        let destName = userMessage;
+
+        // Check if they are heading to a saved place
+        if (userMessage.includes('home') && session.home) {
+            targetCoords = session.home;
+            destName = "Home";
+        } else if (userMessage.includes('work') && session.work) {
+            targetCoords = session.work;
+            destName = "Work";
+        } else {
+            // If it's a new place (e.g., "Jabi Lake Mall"), look it up dynamically!
+            targetCoords = await geocodeAddress(userMessage);
+        }
+
+        if (targetCoords && session.currentLocation) {
+            const route = await getRouteDetails(
+                session.currentLocation.lat, session.currentLocation.lng, 
+                targetCoords.lat, targetCoords.lng
+            );
+            
+            if (route) {
+                // Pass the raw data to Groq so it sounds like a human wrote it
+                const prompt = `You are Stuck AI, a friendly mobility assistant. The user is driving to ${destName}. The trip is ${route.distanceKm} kilometers and takes ${route.timeMinutes} minutes in current traffic. Write a warm, human-like WhatsApp reply giving them this information. Do not sound robotic. Keep it brief.`;
+                replyMessage = await generateHumanReply(prompt);
+            } else {
+                replyMessage = "I tried to map that out, but I couldn't find a clear route. Could you try typing the destination name a bit differently?";
+            }
+        } else if (!session.currentLocation) {
+             replyMessage = "I'd love to route you there, but I don't know where you are right now! Could you drop your live location pin for me?";
+        } else {
+             replyMessage = "I couldn't quite pinpoint that destination. Could you be a bit more specific (like 'Ring Road, Benin City')?";
+        }
+    } 
+    
+    // EVENT E: Fallback Conversation
+    else {
+        const prompt = `You are Stuck AI, a friendly mobility assistant. The user just said: "${userMessage}". Give a very brief, warm reply. If they need routing, gently remind them to drop a location pin.`;
+        replyMessage = await generateHumanReply(prompt);
+    }
+
+    // Send the final Twilio XML response
+    const twiml = `<Response><Message>${replyMessage}</Message></Response>`;
+    res.header('Content-Type', 'text/xml');
+    res.status(200).send(twiml);
 });
 
-// Basic server home route for health monitoring
+// Server Health Check
 app.get('/', (req, res) => {
-    res.send('🚀 Stuck AI MVP with Geoapify Engine is live!');
+    res.send('🚀 Stuck AI Dynamic Conversational Engine is live!');
 });
 
 const PORT = process.env.PORT || 3000;
